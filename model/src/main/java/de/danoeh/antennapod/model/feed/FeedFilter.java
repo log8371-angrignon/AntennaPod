@@ -140,3 +140,4 @@ public class FeedFilter implements Serializable {
         return minimalDuration > -1;
     }
 }
+
