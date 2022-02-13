@@ -6,7 +6,9 @@ import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.app.NotificationManagerCompat;
 
+import de.danoeh.antennapod.core.service.download.DownloadService;
 import org.greenrobot.eventbus.EventBus;
 
 import java.io.File;
@@ -23,13 +25,13 @@ import java.util.concurrent.TimeUnit;
 
 import de.danoeh.antennapod.core.R;
 import de.danoeh.antennapod.core.event.DownloadLogEvent;
-import de.danoeh.antennapod.core.event.FavoritesEvent;
-import de.danoeh.antennapod.core.event.FeedItemEvent;
-import de.danoeh.antennapod.core.event.FeedListUpdateEvent;
-import de.danoeh.antennapod.core.event.MessageEvent;
-import de.danoeh.antennapod.core.event.PlaybackHistoryEvent;
-import de.danoeh.antennapod.core.event.QueueEvent;
-import de.danoeh.antennapod.core.event.UnreadItemsUpdateEvent;
+import de.danoeh.antennapod.event.FavoritesEvent;
+import de.danoeh.antennapod.event.FeedItemEvent;
+import de.danoeh.antennapod.event.FeedListUpdateEvent;
+import de.danoeh.antennapod.event.MessageEvent;
+import de.danoeh.antennapod.event.playback.PlaybackHistoryEvent;
+import de.danoeh.antennapod.event.QueueEvent;
+import de.danoeh.antennapod.event.UnreadItemsUpdateEvent;
 import de.danoeh.antennapod.core.feed.FeedEvent;
 import de.danoeh.antennapod.core.preferences.PlaybackPreferences;
 import de.danoeh.antennapod.core.preferences.UserPreferences;
@@ -128,6 +130,9 @@ public class DBWriter {
             if (media.getId() == PlaybackPreferences.getCurrentlyPlayingFeedMediaId()) {
                 PlaybackPreferences.writeNoMediaPlaying();
                 IntentUtils.sendLocalBroadcast(context, PlaybackService.ACTION_SHUTDOWN_PLAYBACK_SERVICE);
+
+                NotificationManagerCompat nm = NotificationManagerCompat.from(context);
+                nm.cancel(R.id.notification_playing);
             }
 
             // Gpodder: queue delete action for synchronization
@@ -149,7 +154,6 @@ public class DBWriter {
      */
     public static Future<?> deleteFeed(final Context context, final long feedId) {
         return dbExec.submit(() -> {
-            DownloadRequester requester = DownloadRequester.getInstance();
             final Feed feed = DBReader.getFeed(feedId);
             if (feed == null) {
                 return;
@@ -167,7 +171,9 @@ public class DBWriter {
             adapter.removeFeed(feed);
             adapter.close();
 
-            SynchronizationQueueSink.enqueueFeedRemovedIfSynchronizationIsActive(context, feed.getDownload_url());
+            if (!feed.isLocalFeed()) {
+                SynchronizationQueueSink.enqueueFeedRemovedIfSynchronizationIsActive(context, feed.getDownload_url());
+            }
             EventBus.getDefault().post(new FeedListUpdateEvent(feed));
         });
     }
@@ -186,7 +192,6 @@ public class DBWriter {
      * Deleting media also removes the download log entries.
      */
     private static void deleteFeedItemsSynchronous(@NonNull Context context, @NonNull List<FeedItem> items) {
-        DownloadRequester requester = DownloadRequester.getInstance();
         List<FeedItem> queue = DBReader.getQueue();
         List<FeedItem> removedFromQueue = new ArrayList<>();
         for (FeedItem item : items) {
@@ -201,9 +206,8 @@ public class DBWriter {
                 }
                 if (item.getMedia().isDownloaded()) {
                     deleteFeedMediaSynchronous(context, item.getMedia());
-                } else if (requester.isDownloadingFile(item.getMedia())) {
-                    requester.cancelDownload(context, item.getMedia());
                 }
+                DownloadService.cancel(context, item.getMedia().getDownload_url());
             }
         }
 
@@ -779,7 +783,9 @@ public class DBWriter {
             adapter.close();
 
             for (Feed feed : feeds) {
-                SynchronizationQueueSink.enqueueFeedAddedIfSynchronizationIsActive(context, feed.getDownload_url());
+                if (!feed.isLocalFeed()) {
+                    SynchronizationQueueSink.enqueueFeedAddedIfSynchronizationIsActive(context, feed.getDownload_url());
+                }
             }
 
             BackupManager backupManager = new BackupManager(context);
@@ -947,25 +953,6 @@ public class DBWriter {
                 Log.e(TAG, "reorderQueue: Could not load queue");
             }
             adapter.close();
-        });
-    }
-
-    public static Future<?> saveFeedItemAutoDownloadFailed(final FeedItem feedItem) {
-        return dbExec.submit(() -> {
-            int failedAttempts = feedItem.getFailedAutoDownloadAttempts() + 1;
-            long autoDownload;
-            if (!feedItem.getAutoDownload() || failedAttempts >= 10) {
-                autoDownload = 0; // giving up, disable auto download
-                feedItem.setAutoDownload(false);
-            } else {
-                long now = System.currentTimeMillis();
-                autoDownload = (now / 10) * 10 + failedAttempts;
-            }
-            final PodDBAdapter adapter = PodDBAdapter.getInstance();
-            adapter.open();
-            adapter.setFeedItemAutoDownload(feedItem, autoDownload);
-            adapter.close();
-            EventBus.getDefault().post(new UnreadItemsUpdateEvent());
         });
     }
 

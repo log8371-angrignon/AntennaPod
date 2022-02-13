@@ -5,6 +5,7 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.os.Build;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -19,6 +20,9 @@ import androidx.work.WorkManager;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 
+import de.danoeh.antennapod.core.service.download.DownloadRequest;
+import de.danoeh.antennapod.core.service.download.DownloadService;
+import de.danoeh.antennapod.core.service.download.DownloadRequestCreator;
 import org.apache.commons.lang3.StringUtils;
 import org.greenrobot.eventbus.EventBus;
 
@@ -28,14 +32,12 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import de.danoeh.antennapod.core.R;
-import de.danoeh.antennapod.core.event.SyncServiceEvent;
+import de.danoeh.antennapod.event.SyncServiceEvent;
 import de.danoeh.antennapod.core.preferences.UserPreferences;
 import de.danoeh.antennapod.core.service.download.AntennapodHttpClient;
 import de.danoeh.antennapod.core.storage.DBReader;
 import de.danoeh.antennapod.core.storage.DBTasks;
 import de.danoeh.antennapod.core.storage.DBWriter;
-import de.danoeh.antennapod.core.storage.DownloadRequestException;
-import de.danoeh.antennapod.core.storage.DownloadRequester;
 import de.danoeh.antennapod.core.sync.queue.SynchronizationQueueStorage;
 import de.danoeh.antennapod.core.util.FeedItemUtil;
 import de.danoeh.antennapod.core.util.LongList;
@@ -145,11 +147,8 @@ public class SyncService extends Worker {
         for (String downloadUrl : subscriptionChanges.getAdded()) {
             if (!URLChecker.containsUrl(localSubscriptions, downloadUrl) && !queuedRemovedFeeds.contains(downloadUrl)) {
                 Feed feed = new Feed(downloadUrl, null);
-                try {
-                    DownloadRequester.getInstance().downloadFeed(getApplicationContext(), feed);
-                } catch (DownloadRequestException e) {
-                    e.printStackTrace();
-                }
+                DownloadRequest.Builder builder = DownloadRequestCreator.create(feed);
+                DownloadService.download(getApplicationContext(), false, builder.build());
             }
         }
 
@@ -187,7 +186,7 @@ public class SyncService extends Worker {
     private void waitForDownloadServiceCompleted() {
         EventBus.getDefault().postSticky(new SyncServiceEvent(R.string.sync_status_wait_for_downloads));
         try {
-            while (DownloadRequester.getInstance().isDownloadingFeeds()) {
+            while (DownloadService.isRunning) {
                 //noinspection BusyWait
                 Thread.sleep(1000);
             }
@@ -302,7 +301,8 @@ public class SyncService extends Worker {
         Intent intent = getApplicationContext().getPackageManager().getLaunchIntentForPackage(
                 getApplicationContext().getPackageName());
         PendingIntent pendingIntent = PendingIntent.getActivity(getApplicationContext(),
-                R.id.pending_intent_sync_error, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+                R.id.pending_intent_sync_error, intent, PendingIntent.FLAG_UPDATE_CURRENT
+                        | (Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE : 0));
         Notification notification = new NotificationCompat.Builder(getApplicationContext(),
                 NotificationUtils.CHANNEL_ID_SYNC_ERROR)
                 .setContentTitle(getApplicationContext().getString(R.string.gpodnetsync_error_title))
@@ -344,7 +344,10 @@ public class SyncService extends Worker {
     private ISyncService getActiveSyncProvider() {
         String selectedSyncProviderKey = SynchronizationSettings.getSelectedSyncProviderKey();
         SynchronizationProviderViewData selectedService = SynchronizationProviderViewData
-                .valueOf(selectedSyncProviderKey);
+                .fromIdentifier(selectedSyncProviderKey);
+        if (selectedService == null) {
+            return null;
+        }
         switch (selectedService) {
             case GPODDER_NET:
                 return new GpodnetService(AntennapodHttpClient.getHttpClient(),

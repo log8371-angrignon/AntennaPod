@@ -14,9 +14,12 @@ import android.view.SurfaceHolder;
 import androidx.media.AudioAttributesCompat;
 import androidx.media.AudioFocusRequestCompat;
 import androidx.media.AudioManagerCompat;
-import de.danoeh.antennapod.core.event.PlayerErrorEvent;
-import de.danoeh.antennapod.core.storage.DBReader;
+import de.danoeh.antennapod.event.PlayerErrorEvent;
+import de.danoeh.antennapod.event.playback.BufferUpdateEvent;
+import de.danoeh.antennapod.event.playback.SpeedChangedEvent;
 import de.danoeh.antennapod.core.util.playback.MediaPlayerError;
+import de.danoeh.antennapod.playback.base.PlaybackServiceMediaPlayer;
+import de.danoeh.antennapod.playback.base.PlayerStatus;
 import org.antennapod.audio.MediaPlayer;
 
 import java.io.File;
@@ -37,7 +40,7 @@ import de.danoeh.antennapod.model.playback.MediaType;
 import de.danoeh.antennapod.model.feed.VolumeAdaptionSetting;
 import de.danoeh.antennapod.core.feed.util.PlaybackSpeedUtils;
 import de.danoeh.antennapod.core.preferences.UserPreferences;
-import de.danoeh.antennapod.core.util.RewindAfterPauseUtils;
+import de.danoeh.antennapod.playback.base.RewindAfterPauseUtils;
 import de.danoeh.antennapod.core.util.playback.AudioPlayer;
 import de.danoeh.antennapod.core.util.playback.IPlayer;
 import de.danoeh.antennapod.model.playback.Playable;
@@ -71,6 +74,7 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
     private final PlayerLock playerLock;
     private final PlayerExecutor executor;
     private boolean useCallerThread = true;
+    private boolean isShutDown = false;
 
 
     private CountDownLatch seekLatch;
@@ -145,7 +149,7 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
     }
 
     public LocalPSMP(@NonNull Context context,
-                     @NonNull PSMPCallback callback) {
+                     @NonNull PlaybackServiceMediaPlayer.PSMPCallback callback) {
         super(context, callback);
         this.audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
         this.playerLock = new PlayerLock();
@@ -262,9 +266,7 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
         LocalPSMP.this.startWhenPrepared.set(startWhenPrepared);
         setPlayerStatus(PlayerStatus.INITIALIZING, media);
         try {
-            if (media instanceof FeedMedia && ((FeedMedia) media).getItem() == null) {
-                ((FeedMedia) media).setItem(DBReader.getFeedItem(((FeedMedia) media).getItemId()));
-            }
+            callback.ensureMediaInfoLoaded(media);
             callback.onMediaChanged(false);
             setPlaybackParams(PlaybackSpeedUtils.getCurrentPlaybackSpeed(media), UserPreferences.isSkipSilence());
             if (stream) {
@@ -616,7 +618,7 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
     private void setSpeedSyncAndSkipSilence(float speed, boolean skipSilence) {
         playerLock.lock();
         Log.d(TAG, "Playback speed was set to " + speed);
-        callback.playbackSpeedChanged(speed);
+        EventBus.getDefault().post(new SpeedChangedEvent(speed));
         mediaPlayer.setPlaybackParams(speed, skipSilence);
         playerLock.unlock();
     }
@@ -717,30 +719,23 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
      */
     @Override
     public void shutdown() {
-        executor.shutdown();
         if (mediaPlayer != null) {
             try {
-                removeMediaPlayerErrorListener();
+                clearMediaPlayerListeners();
                 if (mediaPlayer.isPlaying()) {
                     mediaPlayer.stop();
                 }
-            } catch (Exception ignore) { }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
             mediaPlayer.release();
+            mediaPlayer = null;
+            playerStatus = PlayerStatus.STOPPED;
         }
+        isShutDown = true;
+        executor.shutdown();
+        abandonAudioFocus();
         releaseWifiLockIfNecessary();
-    }
-
-    private void removeMediaPlayerErrorListener() {
-        if (mediaPlayer instanceof VideoPlayer) {
-            VideoPlayer vp = (VideoPlayer) mediaPlayer;
-            vp.setOnErrorListener((mp, what, extra) -> true);
-        } else if (mediaPlayer instanceof AudioPlayer) {
-            AudioPlayer ap = (AudioPlayer) mediaPlayer;
-            ap.setOnErrorListener((mediaPlayer, i, i1) -> true);
-        } else if (mediaPlayer instanceof ExoPlayerWrapper) {
-            ExoPlayerWrapper ap = (ExoPlayerWrapper) mediaPlayer;
-            ap.setOnErrorListener(message -> { });
-        }
     }
 
     /**
@@ -842,6 +837,7 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
         }
         if (media == null) {
             mediaPlayer = null;
+            playerStatus = PlayerStatus.STOPPED;
             return;
         }
 
@@ -862,10 +858,14 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
 
         @Override
         public void onAudioFocusChange(final int focusChange) {
+            if (isShutDown) {
+                return;
+            }
             if (!PlaybackService.isRunning) {
                 abandonAudioFocus();
                 Log.d(TAG, "onAudioFocusChange: PlaybackService is no longer running");
                 if (focusChange == AudioManager.AUDIOFOCUS_GAIN && pausedBecauseOfTransientAudiofocusLoss) {
+                    pausedBecauseOfTransientAudiofocusLoss = false;
                     new PlaybackServiceStarter(context, getPlayable())
                             .startWhenPrepared(true)
                             .streamIfLastWasStream()
@@ -1009,9 +1009,9 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
         return stream;
     }
 
-    private IPlayer setMediaPlayerListeners(IPlayer mp) {
+    private void setMediaPlayerListeners(IPlayer mp) {
         if (mp == null || media == null) {
-            return mp;
+            return;
         }
         if (mp instanceof VideoPlayer) {
             if (media.getMediaType() != MediaType.VIDEO) {
@@ -1043,7 +1043,31 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
         } else {
             Log.w(TAG, "Unknown media player: " + mp);
         }
-        return mp;
+    }
+
+    private void clearMediaPlayerListeners() {
+        if (mediaPlayer instanceof VideoPlayer) {
+            VideoPlayer vp = (VideoPlayer) mediaPlayer;
+            vp.setOnCompletionListener(x -> { });
+            vp.setOnSeekCompleteListener(x -> { });
+            vp.setOnErrorListener((mediaPlayer, i, i1) -> false);
+            vp.setOnBufferingUpdateListener((mediaPlayer, i) -> { });
+            vp.setOnInfoListener((mediaPlayer, i, i1) -> false);
+        } else if (mediaPlayer instanceof AudioPlayer) {
+            AudioPlayer ap = (AudioPlayer) mediaPlayer;
+            ap.setOnCompletionListener(x -> { });
+            ap.setOnSeekCompleteListener(x -> { });
+            ap.setOnErrorListener((x, y, z) -> false);
+            ap.setOnBufferingUpdateListener((arg0, percent) -> { });
+            ap.setOnInfoListener((arg0, what, extra) -> false);
+        } else if (mediaPlayer instanceof ExoPlayerWrapper) {
+            ExoPlayerWrapper ap = (ExoPlayerWrapper) mediaPlayer;
+            ap.setOnCompletionListener(x -> { });
+            ap.setOnSeekCompleteListener(x -> { });
+            ap.setOnBufferingUpdateListener((arg0, percent) -> { });
+            ap.setOnErrorListener(x -> { });
+            ap.setOnInfoListener((arg0, what, extra) -> false);
+        }
     }
 
     private final MediaPlayer.OnCompletionListener audioCompletionListener =
@@ -1057,14 +1081,10 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
     }
 
     private final MediaPlayer.OnBufferingUpdateListener audioBufferingUpdateListener =
-            (mp, percent) -> genericOnBufferingUpdate(percent);
+            (mp, percent) -> EventBus.getDefault().post(BufferUpdateEvent.progressUpdate(0.01f * percent));
 
     private final android.media.MediaPlayer.OnBufferingUpdateListener videoBufferingUpdateListener =
-            (mp, percent) -> genericOnBufferingUpdate(percent);
-
-    private void genericOnBufferingUpdate(int percent) {
-        callback.onBufferingUpdate(percent);
-    }
+            (mp, percent) -> EventBus.getDefault().post(BufferUpdateEvent.progressUpdate(0.01f * percent));
 
     private final MediaPlayer.OnInfoListener audioInfoListener =
             (mp, what, extra) -> genericInfoListener(what);
@@ -1073,7 +1093,16 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
             (mp, what, extra) -> genericInfoListener(what);
 
     private boolean genericInfoListener(int what) {
-        return callback.onMediaPlayerInfo(what, 0);
+        switch (what) {
+            case android.media.MediaPlayer.MEDIA_INFO_BUFFERING_START:
+                EventBus.getDefault().post(BufferUpdateEvent.started());
+                return true;
+            case android.media.MediaPlayer.MEDIA_INFO_BUFFERING_END:
+                EventBus.getDefault().post(BufferUpdateEvent.ended());
+                return true;
+            default:
+                return true;
+        }
     }
 
     private final MediaPlayer.OnErrorListener audioErrorListener =
@@ -1121,5 +1150,10 @@ public class LocalPSMP extends PlaybackServiceMediaPlayer {
         } else {
             executor.submit(r);
         }
+    }
+
+    @Override
+    public boolean isCasting() {
+        return false;
     }
 }
