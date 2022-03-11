@@ -82,11 +82,20 @@ android {
                 }
             }
         }
+        benchmark {
+			initWith buildTypes.release
+			signingConfig signingConfigs.debug
+			// [START_EXCLUDE silent]
+			// Selects release buildType if the benchmark buildType not available in other modules.
+			matchingFallbacks = ['release']
+			// [START_EXCLUDE silent]
+        }
         release {
             resValue "string", "provider_authority", "de.danoeh.antennapod.provider"
             minifyEnabled true
             shrinkResources true
             signingConfig signingConfigs.releaseConfig
+			proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
         }
     }
 
